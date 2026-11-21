@@ -27,9 +27,69 @@ const MAX_EDGE = 1024;
 
 /** The eight bytes every PNG begins with. */
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+const IHDR_LENGTH = 13; // width, height, bit depth, colour type, compression, filter, interlace
 
-/** Stop the run with a message that names the check that failed. */
-function fail(check: string, detail: string): never {
+/** What the gate needs to know about an image before it is allowed through. */
+type PngFacts = { width: number; height: number; bytes: number };
+
+/**
+ * Validate a buffer as a whole PNG within the gate's limits and report its
+ * geometry. Every rejection is thrown with a message naming the failed check,
+ * so a caller can report it verbatim.
+ */
+function inspectPng(buf: Buffer): PngFacts {
+  // 1. The file must really be a PNG.
+  if (buf.length < PNG_SIGNATURE.length || !buf.subarray(0, PNG_SIGNATURE.length).equals(PNG_SIGNATURE)) {
+    throw new Error(
+      `png-magic: expected the signature 89 50 4E 47 0D 0A 1A 0A, got ${buf.subarray(0, 8).toString('hex')}`,
+    );
+  }
+
+  // 2. The gate refuses anything over 1 MiB.
+  if (buf.length > MAX_BYTES) {
+    throw new Error(`size-limit: ${buf.length} bytes is over the ${MAX_BYTES} byte limit`);
+  }
+
+  // 3. The first chunk of a PNG is IHDR: a 13-byte header chunk whose width and
+  //    height are big-endian 32-bit integers at bytes 16..23.
+  if (buf.length < 8 + 4 + 4 + IHDR_LENGTH || buf.subarray(12, 16).toString('latin1') !== 'IHDR') {
+    throw new Error('ihdr-present: no IHDR chunk where a PNG header must start at byte 12');
+  }
+  if (buf.readUInt32BE(8) !== IHDR_LENGTH) {
+    throw new Error(`ihdr-length: IHDR chunk declares ${buf.readUInt32BE(8)} bytes, expected ${IHDR_LENGTH}`);
+  }
+  const width = buf.readUInt32BE(16);
+  const height = buf.readUInt32BE(20);
+
+  // 4. Walk the chunk list to find the IEND chunk that closes a whole PNG.
+  let chunkStart = 8;
+  let closed = false;
+  while (chunkStart + 8 <= buf.length) {
+    const dataLength = buf.readUInt32BE(chunkStart);
+    const chunkType = buf.subarray(chunkStart + 4, chunkStart + 8).toString('latin1');
+    if (chunkType === 'IEND') {
+      closed = true;
+      break;
+    }
+    chunkStart += 12 + dataLength; // length + type + data + CRC
+  }
+  if (!closed) {
+    throw new Error('iend-present: the chunk list holds no IEND chunk, so the image is truncated');
+  }
+
+  // 5. Both edges must be present and within the pixel ceiling.
+  if (width === 0 || height === 0) {
+    throw new Error(`ihdr-dimensions: IHDR declares ${width}x${height}, both edges must be positive`);
+  }
+  if (width > MAX_EDGE || height > MAX_EDGE) {
+    throw new Error(`dimension-limit: ${width}x${height} is over the ${MAX_EDGE}x${MAX_EDGE} pixel limit`);
+  }
+
+  return { width, height, bytes: buf.length };
+}
+
+/** Exit non-zero with the failed check's own message. */
+function abort(check: string, detail: string): never {
   console.error(`entry.png check failed [${check}]: ${detail}`);
   process.exit(1);
 }
@@ -38,54 +98,19 @@ let source: Buffer;
 try {
   source = readFileSync(SOURCE_PNG);
 } catch (err) {
-  fail('source-readable', `cannot read ${SOURCE_PNG}: ${(err as Error).message}`);
+  abort('source-readable', `cannot read ${SOURCE_PNG}: ${(err as Error).message}`);
 }
 
-// 1. The file must really be a PNG.
-if (source.length < PNG_SIGNATURE.length || !source.subarray(0, 8).equals(PNG_SIGNATURE)) {
-  fail(
-    'png-magic',
-    `expected the PNG signature 89 50 4E 47 0D 0A 1A 0A, got ${source.subarray(0, 8).toString('hex')}`,
+let facts: PngFacts;
+try {
+  facts = inspectPng(source);
+} catch (err) {
+  const message = (err as Error).message;
+  const split = message.indexOf(': ');
+  abort(
+    split > 0 ? message.slice(0, split) : 'inspect',
+    split > 0 ? message.slice(split + 2) : message,
   );
-}
-
-// 2. The gate refuses anything over 1 MiB.
-if (source.length > MAX_BYTES) {
-  fail('size-limit', `${source.length} bytes is over the ${MAX_BYTES} byte limit`);
-}
-
-// 3. The first chunk of a PNG is IHDR: a 13-byte header chunk whose width and
-//    height are big-endian 32-bit integers at bytes 16..23.
-if (source.length < 24 || source.subarray(12, 16).toString('latin1') !== 'IHDR') {
-  fail('ihdr-present', 'no IHDR chunk where a PNG header must start at byte 12');
-}
-if (source.readUInt32BE(8) !== 13) {
-  fail('ihdr-length', `IHDR chunk declares ${source.readUInt32BE(8)} bytes, expected 13`);
-}
-const width = source.readUInt32BE(16);
-const height = source.readUInt32BE(20);
-
-// 4. Walk the chunk list to find the IEND chunk that closes a whole PNG.
-let iendFound = false;
-for (let offset = 8; offset + 8 <= source.length; ) {
-  const length = source.readUInt32BE(offset);
-  const type = source.subarray(offset + 4, offset + 8).toString('latin1');
-  if (type === 'IEND') {
-    iendFound = true;
-    break;
-  }
-  offset += 12 + length; // length + type + data + CRC
-}
-if (!iendFound) {
-  fail('iend-present', 'the chunk list holds no IEND chunk, so the image is truncated');
-}
-
-// 5. Neither edge may exceed 1024 pixels, and neither may be zero.
-if (width === 0 || height === 0) {
-  fail('ihdr-dimensions', `IHDR declares ${width}x${height}, both edges must be positive`);
-}
-if (width > MAX_EDGE || height > MAX_EDGE) {
-  fail('dimension-limit', `${width}x${height} is over the ${MAX_EDGE}x${MAX_EDGE} pixel limit`);
 }
 
 // Write the very bytes that were validated, creating the output directory when
@@ -95,10 +120,18 @@ writeFileSync(OUTPUT_PNG, source);
 
 // Only claim success once the file on disk is byte-identical to the source.
 const written = readFileSync(OUTPUT_PNG);
-if (written.length !== source.length || !written.equals(source)) {
-  fail('byte-identical', `${OUTPUT_PNG} differs from ${SOURCE_PNG} after writing`);
+const identical =
+  written.byteLength === source.byteLength &&
+  written.compare(source) === 0 &&
+  source.compare(written) === 0;
+if (!identical) {
+  abort(
+    'byte-identical',
+    `${OUTPUT_PNG} (${written.byteLength} bytes) does not match ${SOURCE_PNG} (${source.byteLength} bytes)`,
+  );
 }
 
 console.log(
-  `wrote ${OUTPUT_PNG} — ${written.length} bytes, ${width}x${height} PNG, byte-identical to ${SOURCE_PNG}`,
+  `wrote ${OUTPUT_PNG} — ${facts.bytes} bytes, ${facts.width}x${facts.height} PNG, ` +
+    `byte-identical to ${SOURCE_PNG}`,
 );
